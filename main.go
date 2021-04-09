@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"database/sql"
 	"fmt"
 	"io"
@@ -24,25 +25,36 @@ func main() {
 	go func() {
 		address := "localhost:8080"
 		tempdir := filepath.Join("outputs")
-		http.Handle("/outputs/", http.StripPrefix("/outputs", http.FileServer(http.Dir(tempdir))))
+		http.Handle("/outputs/", http.StripPrefix("/outputs",
+			http.FileServer(http.Dir(tempdir))))
 		if err := http.ListenAndServe(address, nil); err != nil {
 			log.Printf("Error in HTTP server for %s: %v", address, err)
 		}
 	}()
 
-	var pathnames []string
+	fmt.Printf("Splitting Complete, HTTP server running. Press enter to start Merging")
+	scanner := bufio.NewScanner(os.Stdin)
+	scanner.Scan()
+
+	// Test Merge Database Code
 	outputDir := "outputs"
 	outputPattern := "output-%d.db"
+
+	var pathnames []string
 	for i := 0; i < 50; i++ {
 		url := "http://localhost:8080/"
 		url = url + filepath.Join(outputDir, fmt.Sprintf(outputPattern, i))
 
 		pathnames = append(pathnames, url)
 	}
-	_, err = mergeDatabases(pathnames, "testoutput.db", "temp.db")
+	_, err = mergeDatabases(pathnames, "austenRebuilt.db", "temp.db")
 	if err != nil {
 		log.Fatalf("%v\n", err)
 	}
+
+	fmt.Printf("Split and Merge Complete, Press enter to close HTTP server")
+	scanner.Scan()
+
 }
 
 func openDatabase(path string) (*sql.DB, error) {
@@ -56,7 +68,6 @@ func openDatabase(path string) (*sql.DB, error) {
 			"&" + "_synchronous=OFF"
 	db, err := sql.Open("sqlite3", path+options)
 	if err != nil {
-		log.Fatalf("%v\n", err)
 		return nil, err
 	}
 	return db, nil
@@ -72,7 +83,6 @@ func createDatabase(path string) (*sql.DB, error) {
 	// create file
 	file, err := os.Create(path)
 	if err != nil {
-		log.Fatalf("%v\n", err)
 		return nil, err
 	}
 	file.Close()
@@ -80,12 +90,10 @@ func createDatabase(path string) (*sql.DB, error) {
 	// open database as file just created
 	db, err := openDatabase(path)
 	if err != nil {
-		log.Fatalf("%v\n", err)
 		return nil, err
 	}
 	_, err = db.Exec("create table pairs (key text, value text);")
 	if err != nil {
-		log.Fatalf("%v\n", err)
 		db.Close()
 		return nil, err
 	}
@@ -97,7 +105,6 @@ func splitDatabase(source, outputDir, outputPattern string, m int) ([]string, er
 	// open input database
 	db, err := openDatabase(source)
 	if err != nil {
-		log.Fatalf("%v\n", err)
 		return nil, err
 	}
 	defer db.Close()
@@ -111,7 +118,6 @@ func splitDatabase(source, outputDir, outputPattern string, m int) ([]string, er
 		pathnames = append(pathnames, dbfile)
 		tdb, err := createDatabase(dbfile)
 		if err != nil {
-			log.Fatalf("%v\n", err)
 			return nil, err
 		}
 		dbs = append(dbs, tdb)
@@ -121,7 +127,6 @@ func splitDatabase(source, outputDir, outputPattern string, m int) ([]string, er
 
 	rows, err := db.Query("select key, value from pairs")
 	if err != nil {
-		log.Fatalf("%v\n", err)
 		return nil, err
 	}
 
@@ -129,15 +134,14 @@ func splitDatabase(source, outputDir, outputPattern string, m int) ([]string, er
 	index := 0
 	total := 0
 	for rows.Next() {
-		if total%50 == 0 {
-			fmt.Printf("%s row: %v\n", source, total)
+		if total%m == 0 {
+			fmt.Printf("Splitting %s row: %v\n", source, total)
 		}
 		// read the data using rows.Scan
 		var key string
 		var value string
 		err = rows.Scan(&key, &value)
 		if err != nil {
-			log.Fatalf("%v\n", err)
 			splitDatabaseCloser(db, dbs)
 			return nil, err
 		}
@@ -145,7 +149,6 @@ func splitDatabase(source, outputDir, outputPattern string, m int) ([]string, er
 		// process the result
 		_, err := dbs[index].Exec("insert into pairs (key, value) values (?,?)", key, value)
 		if err != nil {
-			log.Fatalf("%v\n", err)
 			splitDatabaseCloser(db, dbs)
 			return nil, err
 		}
@@ -158,7 +161,6 @@ func splitDatabase(source, outputDir, outputPattern string, m int) ([]string, er
 		}
 	}
 	if err := rows.Err(); err != nil {
-		log.Fatalf("%v\n", err)
 		splitDatabaseCloser(db, dbs)
 		return nil, err
 	}
@@ -185,7 +187,6 @@ func mergeDatabases(urls []string, path string, temp string) (*sql.DB, error) {
 	// open new database with path
 	db, err := createDatabase(path)
 	if err != nil {
-		log.Fatalf("%v\n", err)
 		return nil, err
 	}
 
@@ -193,11 +194,9 @@ func mergeDatabases(urls []string, path string, temp string) (*sql.DB, error) {
 	for i := 0; i < len(urls); i++ {
 		fmt.Printf("downloading and merging: %s\n", urls[i])
 		if err := download(urls[i], temp); err != nil {
-			log.Fatalf("%v\n", err)
 			return nil, err
 		}
 		if err := gatherInto(db, temp); err != nil {
-			log.Fatalf("%v\n", err)
 			return nil, err
 		}
 	}
@@ -208,14 +207,12 @@ func mergeDatabases(urls []string, path string, temp string) (*sql.DB, error) {
 func download(url, path string) error {
 	out, err := os.Create(path)
 	if err != nil {
-		log.Fatalf("%v\n", err)
 		return err
 	}
 	defer out.Close()
 
 	resp, err := http.Get(url)
 	if err != nil {
-		log.Fatalf("%v\n", err)
 		return err
 	}
 	defer resp.Body.Close()
