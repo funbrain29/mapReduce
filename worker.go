@@ -1,4 +1,4 @@
-package main
+package mapreduce
 
 import (
 	"database/sql"
@@ -66,7 +66,7 @@ func (task *MapTask) Process(tempdir string, client Interface) error {
 	}
 
 	// Open the source file
-	sourceDb, err := openDatabase(filepath.Join(tempdir, mapSourceFile(task.N)))
+	sourceDb, err := openDatabase(filepath.Join(tempdir, mapInputFile(task.N)))
 	if err != nil {
 		log.Fatalf("Error processing Maptask: %v\n", err)
 		return err
@@ -134,6 +134,9 @@ func (task *MapTask) Process(tempdir string, client Interface) error {
 
 func (task *ReduceTask) Process(tempdir string, client Interface) error {
 	fmt.Printf("Processing ReduceTask #%d\n", task.N)
+
+	// get a list of all the sourcefiles we need from sourcehosts
+
 	// Download and merge all map inputs into a Tempfile
 	mergeDatabases(task.SourceHosts, filepath.Join(tempdir, reduceInputFile(task.N)), filepath.Join(tempdir, reduceTempFile(task.N)))
 

@@ -1,4 +1,4 @@
-package main
+package mapreduce
 
 import (
 	"bufio"
@@ -6,185 +6,203 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strconv"
-	"strings"
-	"unicode"
+	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
-func main() {
-	log.SetFlags(log.Ltime | log.Lshortfile)
-	runtime.GOMAXPROCS(1)
-
-	MAP_TASKS := 9
-	REDUCE_TASKS := 3
-	INPUT_FILE_NAME := "austen.db"
-	scanner := bufio.NewScanner(os.Stdin)
+func master(client Interface, portNumber string, map_tasks string, reduce_tasks string, source_filename string) error {
+	// collect arguments into int values
+	MAP_TASKS, err := strconv.Atoi(map_tasks)
+	if err != nil {
+		log.Fatalf("%v\n", err)
+	}
+	REDUCE_TASKS, err := strconv.Atoi(reduce_tasks)
+	if err != nil {
+		log.Fatalf("%v\n", err)
+	}
+	PORT, err := strconv.Atoi(portNumber)
+	if err != nil {
+		log.Fatalf("%v\n", err)
+	}
 
 	//setup tempdir and http server
 	tempdir := filepath.Join(os.TempDir(), fmt.Sprintf("mapreduce.%d", os.Getpid()))
 	os.RemoveAll(tempdir)
 	os.Mkdir(tempdir, 0775)
 	defer os.RemoveAll(tempdir)
-	address := "localhost:3410"
-	go func() {
-		http.Handle("/data/", http.StripPrefix("/data", http.FileServer(http.Dir(tempdir))))
-		if err := http.ListenAndServe(address, nil); err != nil {
-			log.Printf("Error in HTTP server for %s: %v", address, err)
-		}
-	}()
+	address := getLocalAddress(PORT)
+	scanner := bufio.NewScanner(os.Stdin)
+
+	actor := masterServer(address, PORT, tempdir)
+	finished := make(chan struct{})
+	actor <- func(f *Master) {
+		finished <- struct{}{}
+	}
+	<-finished
 	fmt.Printf("TEMP DIR: %s\n", tempdir)
-	fmt.Printf("HTTP Server running, Press enter to begin MapReduce")
-	scanner.Scan()
+	fmt.Printf("Starting Mapreduce. Splitting %s into %v map tasks and %v reduce tasks\n", source_filename, MAP_TASKS, REDUCE_TASKS)
+
+	// split INPUT_FILE_NAME into MAP_TASKS files
+	_, err = splitDatabase(source_filename, filepath.Join(tempdir), "map_%d_source.db", MAP_TASKS)
+	if err != nil {
+		log.Fatalf("%v\n", err)
+	}
 
 	// create map tasks
 	var mTasks []MapTask
 	for i := 0; i < MAP_TASKS; i++ {
-		mTasks = append(mTasks, MapTask{M: 9, R: 3, N: i, SourceHost: filepath.Join(address, "data")})
+		mTasks = append(mTasks, MapTask{M: MAP_TASKS, R: REDUCE_TASKS, N: i, SourceHost: address})
 	}
+	var response LocalResponse
+	var junk Nothing
 
-	// create addressList for reduce tasks
-	var addressList []string
-	for i := 0; i < REDUCE_TASKS; i++ {
-		for j := 0; j < MAP_TASKS; j++ {
-			addressList = append(addressList, "http://"+filepath.Join(address, "data", fmt.Sprintf("map_%d_output_%d.db", j, i)))
+	// send map tasks to actor
+	actor.ExecuteMapTasks(mTasks, &junk)
+
+	fmt.Printf("Executing map tasks, waiting for completion\n")
+	// continue to ask until map tasks are finished
+	actor.GetMapTaskFinished(junk, &response)
+	for !response.TasksDone {
+		time.Sleep(1 * time.Second)
+		actor.GetMapTaskFinished(junk, &response)
+	}
+	addressList := response.AddressList
+
+	// setup the ip addresses into http links to all of the output files
+	var SourceFiles []string
+	for i, v := range addressList {
+		for j := 0; j < REDUCE_TASKS; j++ {
+			SourceFiles = append(SourceFiles, makeURL(v, mapOutputFile(i, j)))
 		}
 	}
 
 	// divide addressList into REDUCETASK parts
 	var divided [][]string
-	chunkSize := len(addressList) / REDUCE_TASKS
-	for i := 0; i < len(addressList); i += chunkSize {
+	chunkSize := len(SourceFiles) / REDUCE_TASKS
+	for i := 0; i < len(SourceFiles); i += chunkSize {
 		end := i + chunkSize
 
-		if end > len(addressList) {
-			end = len(addressList)
+		if end > len(SourceFiles) {
+			end = len(SourceFiles)
 		}
-
-		divided = append(divided, addressList[i:end])
+		divided = append(divided, SourceFiles[i:end])
 	}
 
 	// create list of reduce tasks
 	var rTasks []ReduceTask
 	for i := 0; i < REDUCE_TASKS; i++ {
-		rTasks = append(rTasks, ReduceTask{M: 9, R: 3, N: i, SourceHosts: divided[i]})
+		rTasks = append(rTasks, ReduceTask{M: MAP_TASKS, R: REDUCE_TASKS, N: i, SourceHosts: divided[i]})
+	}
+	actor.ExecuteReduceTasks(rTasks, &junk)
+	fmt.Printf("Executing Reduce tasks, waiting for completion\n")
+	actor.GetReduceTaskFinished(junk, &response)
+	for !response.TasksDone {
+		time.Sleep(1 * time.Second)
+		actor.GetReduceTaskFinished(junk, &response)
 	}
 
-	// split INPUT_FILE_NAME into MAP_TASKS files
-	_, err := splitDatabase(INPUT_FILE_NAME, filepath.Join(tempdir), "map_%d_source.db", MAP_TASKS)
-	if err != nil {
-		log.Fatalf("%v\n", err)
-	}
+	addressList = response.AddressList
 
-	// create client object with Map and Reduce functions
-	client := Client{}
-
-	// run all map tasks
-	for _, v := range mTasks {
-		v.Process(tempdir, client)
-	}
-	//run all reduce tasks
-	for _, v := range rTasks {
-		v.Process(tempdir, client)
-	}
-	fmt.Printf("Reduce tasks completed\n")
-
+	fmt.Printf("All MapReduce work done, merging output file\n")
 	// merge reduce files back to one file
 	var mergeList []string
-	for i := 0; i < REDUCE_TASKS; i++ {
-		mergeList = append(mergeList, "http://"+filepath.Join(address, "data", fmt.Sprintf("reduce_%d_output.db", i)))
+	for i, v := range addressList {
+		mergeList = append(mergeList, makeURL(v, reduceOutputFile(i)))
 	}
-	outputFileName := "ResultsOf-" + INPUT_FILE_NAME
+	outputFileName := "ResultsOf-" + source_filename
 	mergeDatabases(mergeList, outputFileName, filepath.Join(tempdir, "temp.db"))
+
+	// after merging, shutdown any workers and wait a moment to ensure they close
+	actor.Shutdown(junk, &junk)
+	time.Sleep(1 * time.Second)
 
 	// Stall for user input before quitting and deleting temp files
 	fmt.Printf("'%s' created. Press enter to delete all temp data in: %s", outputFileName, tempdir)
 	scanner.Scan()
-}
 
-type Client struct{}
-
-func (c Client) Map(key, value string, output chan<- Pair) error {
-	defer close(output)
-	lst := strings.Fields(value)
-	for _, elt := range lst {
-		word := strings.Map(func(r rune) rune {
-			if unicode.IsLetter(r) || unicode.IsDigit(r) {
-				return unicode.ToLower(r)
-			}
-			return -1
-		}, elt)
-		if len(word) > 0 {
-			output <- Pair{Key: word, Value: "1"}
-		}
-	}
 	return nil
 }
 
-func (c Client) Reduce(key string, values <-chan string, output chan<- Pair) error {
-	defer close(output)
-	count := 0
-	for v := range values {
-		i, err := strconv.Atoi(v)
+func worker(client Interface, portNumber string, masterPort string) error {
+	// collect arguments into int values
+	masterPortNumber, err := strconv.Atoi(masterPort)
+	if err != nil {
+		log.Fatalf("%v\n", err)
+	}
+
+	PORT, err := strconv.Atoi(portNumber)
+	if err != nil {
+		log.Fatalf("%v\n", err)
+	}
+
+	//setup tempdir and http server
+	tempdir := filepath.Join(os.TempDir(), fmt.Sprintf("mapreduce.%d", os.Getpid()))
+	os.RemoveAll(tempdir)
+	os.Mkdir(tempdir, 0775)
+	defer os.RemoveAll(tempdir)
+	address := getLocalAddress(PORT)
+	maddress := getLocalAddress(masterPortNumber)
+
+	l, e := net.Listen("tcp", fmt.Sprintf(":%v", PORT))
+	if e != nil {
+		log.Fatal("listen error:", e)
+	}
+	http.Handle("/data/", http.StripPrefix("/data", http.FileServer(http.Dir(tempdir))))
+	go http.Serve(l, nil)
+
+	fmt.Printf("Started fileserver with address: %s\n", address)
+	fmt.Printf("TEMP DIR: %s\n", tempdir)
+	fmt.Printf("Waiting for work...\n")
+
+	for {
+		var response Response
+		err = callErr(maddress, "Server.GetWork", &address, &response)
 		if err != nil {
-			return err
+			log.Fatalf("%v\n", err)
 		}
-		count += i
+		if response.WorkType != 0 { // If there is work to do
+			if response.WorkType == 1 { // map
+				response.Maptask.Process(tempdir, client)
+			} else if response.WorkType == 2 { // reduce
+				response.Reducetask.Process(tempdir, client)
+			}
+			var response Response
+			err = callErr(maddress, "Server.FinishedWork", &address, &response)
+			if err != nil {
+				log.Fatalf("%v\n", err)
+			}
+
+		} else if response.Shutdown { // If no work, check if shutting down
+			fmt.Printf("Master indicated Mapreduce job completed, deleting temp files and closing program.\n")
+			return nil
+		}
+		// sleep a second inbetween requests
+		time.Sleep(1 * time.Second)
 	}
-	p := Pair{Key: key, Value: strconv.Itoa(count)}
-	output <- p
-	return nil
 }
 
-// func mapSourceFile(m int) string { return fmt.Sprintf("map_%d_source.db", m) }
-
-func testSplitAndMerge() {
+func Start(client Interface, dir string, INPUT_FILE_NAME string) error {
 	log.SetFlags(log.Ltime | log.Lshortfile)
+	runtime.GOMAXPROCS(1)
 
-	// Test Split Database Code
-	_, err := splitDatabase("austen.db", "outputs", "output-%d.db", 50)
-	if err != nil {
-		log.Fatalf("%v\n", err)
+	// get argument data from command line
+	args := os.Args[1:]
+
+	if len(args) == 2 { //worker
+		return worker(client, args[0], args[1])
+	} else if len(args) == 3 { //master
+		return master(client, args[0], args[1], args[2], INPUT_FILE_NAME)
+	} else { // throw error
+		log.Fatalf("\nPlease supply arguments for one of the following:\nMaster Node: [PortNumber, NumberOfMapTasks, NumberOfReduceTasks]\nWorker Node: [PortNumber, MasterPortNumber]\n")
 	}
-
-	go func() {
-		address := "localhost:8080"
-		tempdir := filepath.Join("outputs")
-		http.Handle("/outputs/", http.StripPrefix("/outputs",
-			http.FileServer(http.Dir(tempdir))))
-		if err := http.ListenAndServe(address, nil); err != nil {
-			log.Printf("Error in HTTP server for %s: %v", address, err)
-		}
-	}()
-
-	fmt.Printf("Splitting Complete, HTTP server running. Press enter to start Merging")
-	scanner := bufio.NewScanner(os.Stdin)
-	scanner.Scan()
-
-	// Test Merge Database Code
-	outputDir := "outputs"
-	outputPattern := "output-%d.db"
-
-	var pathnames []string
-	for i := 0; i < 50; i++ {
-		url := "http://localhost:8080/"
-		url = url + filepath.Join(outputDir, fmt.Sprintf(outputPattern, i))
-
-		pathnames = append(pathnames, url)
-	}
-	_, err = mergeDatabases(pathnames, "austenRebuilt.db", "temp.db")
-	if err != nil {
-		log.Fatalf("%v\n", err)
-	}
-
-	fmt.Printf("Split and Merge Complete, Press enter to close HTTP server")
-	scanner.Scan()
-
+	return nil
 }
 
 func openDatabase(path string) (*sql.DB, error) {
@@ -261,6 +279,7 @@ func splitDatabase(source, outputDir, outputPattern string, m int) ([]string, er
 
 	// get total amount of rows
 	var totalRows int
+	log.Printf("source: %s\n", source)
 	rows, err := db.Query("select count(1) from pairs")
 	if err != nil {
 		log.Fatalf("%v", err)
@@ -361,7 +380,6 @@ func mergeDatabases(urls []string, path string, temp string) (*sql.DB, error) {
 
 	// for every url in urls, download the file and merge into db
 	for i := 0; i < len(urls); i++ {
-		fmt.Printf("downloading and merging: %s\n", urls[i])
 		if err := download(urls[i], temp); err != nil {
 			log.Fatalf("%v", err)
 			return nil, err
@@ -371,7 +389,6 @@ func mergeDatabases(urls []string, path string, temp string) (*sql.DB, error) {
 			return nil, err
 		}
 	}
-	fmt.Printf("Merging complete\n")
 
 	return db, nil
 }
