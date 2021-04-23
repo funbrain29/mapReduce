@@ -102,8 +102,11 @@ func (s Server) FinishedWork(ip string, reply *Response) error {
 	finished := make(chan struct{})
 	s <- func(f *Master) {
 		for i := range f.MapTasks {
-			if f.Mappers[i] == ip {
+			if f.Mappers[i] == ip && f.MapProg[i] != 2 {
 				f.MapProg[i] = 2
+				for j := 0; j < f.MapTasks[i].R; j++ {
+					f.ReduceTasks[j].SourceHosts = append(f.ReduceTasks[j].SourceHosts, makeURL(ip, mapOutputFile(i, j)))
+				}
 			}
 		}
 		for i := range f.ReduceTasks {
@@ -124,6 +127,14 @@ func (s Server) ExecuteMapTasks(Tasks []MapTask, junk *Nothing) error {
 		for range f.MapTasks {
 			f.MapProg = append(f.MapProg, 0)
 			f.Mappers = append(f.Mappers, "")
+		}
+		var hosts []string
+		/*for i := 0; i < Tasks[0].M; i++ {
+			hosts = append(hosts, "")
+		}*/
+		for i := 0; i < Tasks[0].R; i++ {
+			f.ReduceTasks = append(f.ReduceTasks, ReduceTask{M: Tasks[0].M, R: Tasks[0].R, N: i, SourceHosts: hosts})
+			f.Reducers = append(f.Reducers, "")
 		}
 		finished <- struct{}{}
 	}
@@ -157,13 +168,11 @@ func (s Server) GetMapTaskFinished(junk Nothing, response *LocalResponse) error 
 	return nil
 }
 
-func (s Server) ExecuteReduceTasks(Tasks []ReduceTask, junk *Nothing) error {
+func (s Server) ExecuteReduceTasks(_ *Nothing, _ *Nothing) error {
 	finished := make(chan struct{})
 	s <- func(f *Master) {
-		f.ReduceTasks = Tasks
 		for range f.ReduceTasks {
 			f.ReduceProg = append(f.ReduceProg, 0)
-			f.Reducers = append(f.Reducers, "")
 		}
 		finished <- struct{}{}
 	}

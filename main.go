@@ -73,34 +73,10 @@ func master(client Interface, portNumber string, map_tasks string, reduce_tasks 
 		time.Sleep(1 * time.Second)
 		actor.GetMapTaskFinished(junk, &response)
 	}
-	addressList := response.AddressList
 
-	// setup the ip addresses into http links to all of the output files
-	var SourceFiles []string
-	for i, v := range addressList {
-		for j := 0; j < REDUCE_TASKS; j++ {
-			SourceFiles = append(SourceFiles, makeURL(v, mapOutputFile(i, j)))
-		}
-	}
+	// start reduce tasks, created from the map tasks, after all map tasks finished
+	actor.ExecuteReduceTasks(&junk, &junk)
 
-	// divide addressList into REDUCETASK parts
-	var divided [][]string
-	chunkSize := len(SourceFiles) / REDUCE_TASKS
-	for i := 0; i < len(SourceFiles); i += chunkSize {
-		end := i + chunkSize
-
-		if end > len(SourceFiles) {
-			end = len(SourceFiles)
-		}
-		divided = append(divided, SourceFiles[i:end])
-	}
-
-	// create list of reduce tasks
-	var rTasks []ReduceTask
-	for i := 0; i < REDUCE_TASKS; i++ {
-		rTasks = append(rTasks, ReduceTask{M: MAP_TASKS, R: REDUCE_TASKS, N: i, SourceHosts: divided[i]})
-	}
-	actor.ExecuteReduceTasks(rTasks, &junk)
 	fmt.Printf("Executing Reduce tasks, waiting for completion\n")
 	actor.GetReduceTaskFinished(junk, &response)
 	for !response.TasksDone {
@@ -108,14 +84,16 @@ func master(client Interface, portNumber string, map_tasks string, reduce_tasks 
 		actor.GetReduceTaskFinished(junk, &response)
 	}
 
-	addressList = response.AddressList
+	addressList := response.AddressList
 
+	fmt.Printf("addressList: %v\n", addressList)
 	fmt.Printf("All MapReduce work done, merging output file\n")
 	// merge reduce files back to one file
 	var mergeList []string
 	for i, v := range addressList {
 		mergeList = append(mergeList, makeURL(v, reduceOutputFile(i)))
 	}
+	fmt.Printf("mergeList: %v\n", mergeList)
 	outputFileName := "ResultsOf-" + source_filename
 	mergeDatabases(mergeList, outputFileName, filepath.Join(tempdir, "temp.db"))
 
@@ -181,6 +159,8 @@ func worker(client Interface, portNumber string, masterPort string) error {
 
 		} else if response.Shutdown { // If no work, check if shutting down
 			fmt.Printf("Master indicated Mapreduce job completed, deleting temp files and closing program.\n")
+			scanner := bufio.NewScanner(os.Stdin)
+			scanner.Scan()
 			return nil
 		}
 		// sleep a second inbetween requests
@@ -373,17 +353,19 @@ func splitDatabaseCloser(db *sql.DB, dbs []*sql.DB) {
 func mergeDatabases(urls []string, path string, temp string) (*sql.DB, error) {
 	// open new database with path
 	db, err := createDatabase(path)
+	defer db.Close()
 	if err != nil {
 		log.Fatalf("%v", err)
 		return nil, err
 	}
 
 	// for every url in urls, download the file and merge into db
-	for i := 0; i < len(urls); i++ {
+	for i := range urls {
 		if err := download(urls[i], temp); err != nil {
 			log.Fatalf("%v", err)
 			return nil, err
 		}
+		time.Sleep(1 * time.Second)
 		if err := gatherInto(db, temp); err != nil {
 			log.Fatalf("%v", err)
 			return nil, err
