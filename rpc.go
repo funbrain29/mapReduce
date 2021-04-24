@@ -78,7 +78,7 @@ func (s Server) GetWork(ip string, reply *Response) error {
 			}
 		}
 		// check for reduce work
-		for i := range f.ReduceTasks {
+		for i := range f.ReduceProg {
 			if f.ReduceProg[i] == 0 { // there is work availaible
 				fmt.Printf("Worker '%s' has taken reduce job #%v\n", ip, i)
 				f.ReduceProg[i] = 1
@@ -109,7 +109,7 @@ func (s Server) FinishedWork(ip string, reply *Response) error {
 				}
 			}
 		}
-		for i := range f.ReduceTasks {
+		for i := range f.ReduceProg {
 			if f.Reducers[i] == ip {
 				f.ReduceProg[i] = 2
 			}
@@ -129,9 +129,6 @@ func (s Server) ExecuteMapTasks(Tasks []MapTask, junk *Nothing) error {
 			f.Mappers = append(f.Mappers, "")
 		}
 		var hosts []string
-		/*for i := 0; i < Tasks[0].M; i++ {
-			hosts = append(hosts, "")
-		}*/
 		for i := 0; i < Tasks[0].R; i++ {
 			f.ReduceTasks = append(f.ReduceTasks, ReduceTask{M: Tasks[0].M, R: Tasks[0].R, N: i, SourceHosts: hosts})
 			f.Reducers = append(f.Reducers, "")

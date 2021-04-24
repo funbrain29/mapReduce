@@ -17,6 +17,23 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+func Start(client Interface, INPUT_FILE_NAME string) error {
+	log.SetFlags(log.Ltime | log.Lshortfile)
+	runtime.GOMAXPROCS(1)
+
+	// get argument data from command line
+	args := os.Args[1:]
+
+	if len(args) == 2 { //worker
+		return worker(client, args[0], args[1])
+	} else if len(args) == 3 { //master
+		return master(client, args[0], args[1], args[2], INPUT_FILE_NAME)
+	} else { // throw error
+		log.Fatalf("\nPlease supply arguments for one of the following:\nMaster Node: [PortNumber, NumberOfMapTasks, NumberOfReduceTasks]\nWorker Node: [PortNumber, MasterPortNumber]\n")
+	}
+	return nil
+}
+
 func master(client Interface, portNumber string, map_tasks string, reduce_tasks string, source_filename string) error {
 	// collect arguments into int values
 	MAP_TASKS, err := strconv.Atoi(map_tasks)
@@ -41,11 +58,6 @@ func master(client Interface, portNumber string, map_tasks string, reduce_tasks 
 	scanner := bufio.NewScanner(os.Stdin)
 
 	actor := masterServer(address, PORT, tempdir)
-	finished := make(chan struct{})
-	actor <- func(f *Master) {
-		finished <- struct{}{}
-	}
-	<-finished
 	fmt.Printf("TEMP DIR: %s\n", tempdir)
 	fmt.Printf("Starting Mapreduce. Splitting %s into %v map tasks and %v reduce tasks\n", source_filename, MAP_TASKS, REDUCE_TASKS)
 
@@ -86,14 +98,12 @@ func master(client Interface, portNumber string, map_tasks string, reduce_tasks 
 
 	addressList := response.AddressList
 
-	fmt.Printf("addressList: %v\n", addressList)
 	fmt.Printf("All MapReduce work done, merging output file\n")
 	// merge reduce files back to one file
 	var mergeList []string
 	for i, v := range addressList {
 		mergeList = append(mergeList, makeURL(v, reduceOutputFile(i)))
 	}
-	fmt.Printf("mergeList: %v\n", mergeList)
 	outputFileName := "ResultsOf-" + source_filename
 	mergeDatabases(mergeList, outputFileName, filepath.Join(tempdir, "temp.db"))
 
@@ -158,7 +168,7 @@ func worker(client Interface, portNumber string, masterPort string) error {
 			}
 
 		} else if response.Shutdown { // If no work, check if shutting down
-			fmt.Printf("Master indicated Mapreduce job completed, deleting temp files and closing program.\n")
+			fmt.Printf("Master indicated Mapreduce job completed, Press enter to delete temp files and quit")
 			scanner := bufio.NewScanner(os.Stdin)
 			scanner.Scan()
 			return nil
@@ -166,23 +176,6 @@ func worker(client Interface, portNumber string, masterPort string) error {
 		// sleep a second inbetween requests
 		time.Sleep(1 * time.Second)
 	}
-}
-
-func Start(client Interface, dir string, INPUT_FILE_NAME string) error {
-	log.SetFlags(log.Ltime | log.Lshortfile)
-	runtime.GOMAXPROCS(1)
-
-	// get argument data from command line
-	args := os.Args[1:]
-
-	if len(args) == 2 { //worker
-		return worker(client, args[0], args[1])
-	} else if len(args) == 3 { //master
-		return master(client, args[0], args[1], args[2], INPUT_FILE_NAME)
-	} else { // throw error
-		log.Fatalf("\nPlease supply arguments for one of the following:\nMaster Node: [PortNumber, NumberOfMapTasks, NumberOfReduceTasks]\nWorker Node: [PortNumber, MasterPortNumber]\n")
-	}
-	return nil
 }
 
 func openDatabase(path string) (*sql.DB, error) {
